@@ -56,3 +56,9 @@ data/processed/
 # OS
 Thumbs.db
 
+# Chroma / local vector databases
+chroma/
+chromadb/
+persist/
+data/chroma/
+storage/
