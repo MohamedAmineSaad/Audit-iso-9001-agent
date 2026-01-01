@@ -1,6 +1,8 @@
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, Depends
 from typing import Any, Dict
 import shlex
+from sqlalchemy.ext.asyncio import AsyncSession
+from motor.motor_asyncio import AsyncIOMotorDatabase
 
 from api.runner import (
     run_chat_one_turn,
@@ -15,6 +17,10 @@ from api.schemas import (
     ChatIn, AnalyzeIn, AnalyzeAgenticIn, IndexIn,
     NormalizedResponse
 )
+
+from api.database.postgres import get_db
+from api.database.mongodb import get_mongo_db
+from api.database.models import AuditSession
 
 app = FastAPI(title="Audit ISO 9001 API")
 
@@ -82,36 +88,82 @@ def chat(payload: ChatIn):
 
 
 @app.post("/v1/analyze", response_model=NormalizedResponse)
-def analyze(payload: AnalyzeIn):
+async def analyze(
+    payload: AnalyzeIn,
+    pg_db: AsyncSession = Depends(get_db),
+    mg_db: AsyncIOMotorDatabase = Depends(get_mongo_db)
+):
     doc_path = payload.document
     res = run_analyze(doc_path)
+    
+    # Store in PostgreSQL
+    new_session = AuditSession(
+        user_id="anonymous",
+        document_name=doc_path,
+        overall_score=0.0 # Placeholder, update based on res
+    )
+    pg_db.add(new_session)
+    await pg_db.commit()
+    await pg_db.refresh(new_session)
+    
+    # Store in MongoDB
+    detailed_report = {
+        "session_id": new_session.id,
+        "full_report": res,
+        "metadata": {"document": doc_path}
+    }
+    await mg_db["reports"].insert_one(detailed_report)
+
     data = {
         "document": res.get("document", doc_path),
         "report": res.get("report"),
         "summary": res.get("summary"),
         "actions": res.get("actions", []),
+        "session_id": new_session.id
     }
     return _resp("command", "analyze", data, res)
 
 
 @app.post("/v1/analyze-agentic", response_model=NormalizedResponse)
-def analyze_agentic(payload: AnalyzeAgenticIn):
+async def analyze_agentic(
+    payload: AnalyzeAgenticIn,
+    pg_db: AsyncSession = Depends(get_db),
+    mg_db: AsyncIOMotorDatabase = Depends(get_mongo_db)
+):
     doc_path = payload.document
     res = run_analyze_agentic(doc_path)
+    
+    # Store in PostgreSQL
+    new_session = AuditSession(
+        user_id="anonymous",
+        document_name=doc_path,
+        overall_score=0.0
+    )
+    pg_db.add(new_session)
+    await pg_db.commit()
+    await pg_db.refresh(new_session)
+    
+    # Store in MongoDB
+    detailed_report = {
+        "session_id": new_session.id,
+        "full_report": res,
+        "metadata": {"document": doc_path, "mode": "agentic"}
+    }
+    await mg_db["reports"].insert_one(detailed_report)
+
     data = {
         "document": doc_path,
-        "note": "Agentic analysis executed (parsing can be added later).",
+        "note": "Agentic analysis executed.",
+        "session_id": new_session.id
     }
     return _resp("command", "analyze-agentic", data, res)
 
 
 @app.post("/v1/index", response_model=NormalizedResponse)
 def index(payload: IndexIn):
-    # keep it simple for now: runner will still run "index".
-    # if your runner later supports "force", you can pass a flag.
     res = run_index()
     data = {
-        "note": "Index command executed (may ask for confirmation in CLI; runner should auto-handle).",
+        "note": "Index command executed.",
         "force": payload.force,
     }
     return _resp("command", "index", data, res)
@@ -128,7 +180,11 @@ class MessageIn(BaseModel):
     text: str
 
 @app.post("/v1/message", response_model=NormalizedResponse)
-def message(payload: MessageIn) -> Dict[str, Any]:
+async def message(
+    payload: MessageIn,
+    pg_db: AsyncSession = Depends(get_db),
+    mg_db: AsyncIOMotorDatabase = Depends(get_mongo_db)
+) -> Dict[str, Any]:
     text = (payload.text or "").strip()
 
     if text.startswith("/"):
@@ -151,10 +207,10 @@ def message(payload: MessageIn) -> Dict[str, Any]:
             return search(query=query, k=k)
 
         if command == "/analyze" and len(parts) >= 2:
-            return analyze(AnalyzeIn(document=parts[1]))
+            return await analyze(AnalyzeIn(document=parts[1]), pg_db, mg_db)
 
         if command in ("/analyze-agentic", "/analyze_agentic") and len(parts) >= 2:
-            return analyze_agentic(AnalyzeAgenticIn(document=parts[1]))
+            return await analyze_agentic(AnalyzeAgenticIn(document=parts[1]), pg_db, mg_db)
 
         return _resp(
             "command",
