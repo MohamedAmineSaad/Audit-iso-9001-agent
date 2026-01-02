@@ -1,8 +1,9 @@
-from fastapi import FastAPI, Query, Depends
+from fastapi import FastAPI, Query, Depends, HTTPException
 from typing import Any, Dict
 import shlex
 from sqlalchemy.ext.asyncio import AsyncSession
 from motor.motor_asyncio import AsyncIOMotorDatabase
+from contextlib import asynccontextmanager
 
 from api.runner import (
     run_chat_one_turn,
@@ -18,11 +19,26 @@ from api.schemas import (
     NormalizedResponse
 )
 
-from api.database.postgres import get_db
-from api.database.mongodb import get_mongo_db
-from api.database.models import AuditSession
+from api.database import (
+    get_db, 
+    get_mongo_db, 
+    connect_to_mongo, 
+    close_mongo_connection, 
+    init_postgres,
+    AuditSession
+)
 
-app = FastAPI(title="Audit ISO 9001 API")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup: Connect to databases
+    await connect_to_mongo()
+    # Optional: Auto-create PG tables on startup (useful for dev)
+    # await init_postgres()
+    yield
+    # Shutdown: Close connections
+    await close_mongo_connection()
+
+app = FastAPI(title="Audit ISO 9001 API", lifespan=lifespan)
 
 
 # -----------------------
@@ -96,21 +112,27 @@ async def analyze(
     doc_path = payload.document
     res = run_analyze(doc_path)
     
-    # Store in PostgreSQL
+    # 1. Store structured data in PostgreSQL
+    # We extract the summary if available for the PG record
+    summary_text = res.get("summary", "")
     new_session = AuditSession(
-        user_id="anonymous",
+        user_id="anonymous", # Replace with auth logic if needed
         document_name=doc_path,
-        overall_score=0.0 # Placeholder, update based on res
+        overall_score=0.0, # You can parse a score from 'res' if your LLM returns one
+        summary=summary_text[:500] if summary_text else None # Truncate for PG
     )
     pg_db.add(new_session)
     await pg_db.commit()
     await pg_db.refresh(new_session)
     
-    # Store in MongoDB
+    # 2. Store full unstructured report in MongoDB
     detailed_report = {
         "session_id": new_session.id,
         "full_report": res,
-        "metadata": {"document": doc_path}
+        "metadata": {
+            "document": doc_path,
+            "type": "standard_analysis"
+        }
     }
     await mg_db["reports"].insert_one(detailed_report)
 
@@ -133,28 +155,34 @@ async def analyze_agentic(
     doc_path = payload.document
     res = run_analyze_agentic(doc_path)
     
-    # Store in PostgreSQL
+    # 1. Store structured data in PostgreSQL
     new_session = AuditSession(
         user_id="anonymous",
         document_name=doc_path,
-        overall_score=0.0
+        overall_score=0.0,
+        summary="Agentic analysis performed."
     )
     pg_db.add(new_session)
     await pg_db.commit()
     await pg_db.refresh(new_session)
     
-    # Store in MongoDB
+    # 2. Store full unstructured report in MongoDB
     detailed_report = {
         "session_id": new_session.id,
         "full_report": res,
-        "metadata": {"document": doc_path, "mode": "agentic"}
+        "metadata": {
+            "document": doc_path, 
+            "mode": "agentic",
+            "raw_output": res.get("raw_output", "")
+        }
     }
     await mg_db["reports"].insert_one(detailed_report)
 
     data = {
         "document": doc_path,
         "note": "Agentic analysis executed.",
-        "session_id": new_session.id
+        "session_id": new_session.id,
+        "raw_output": res.get("raw_output", "")
     }
     return _resp("command", "analyze-agentic", data, res)
 
