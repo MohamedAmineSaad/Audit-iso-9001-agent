@@ -119,7 +119,7 @@ async def analyze(
         user_id="anonymous", # Replace with auth logic if needed
         document_name=doc_path,
         overall_score=0.0, # You can parse a score from 'res' if your LLM returns one
-        summary=summary_text[:500] if summary_text else None # Truncate for PG
+        summary=str(summary_text)[:500] if summary_text is not None else None
     )
     pg_db.add(new_session)
     await pg_db.commit()
